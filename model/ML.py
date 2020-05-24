@@ -7,10 +7,15 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import pickle
 import os
 from collections import Counter
-from sklearn.naive_bayes import MultinomialNB as MNB #
-from sklearn.linear_model import LogisticRegression as LR
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import LabelEncoder,OneHotEncoder
+
+# model in 1st stage
+from sklearn.linear_model import LogisticRegression as LR
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier
+
+# model in 2nd stage
 import lightgbm as lgb
 
 #思路：采用和model_1同样的特征选择,TF-IDF做特征处理，然后利用机器学习去进行学习（LR，LGB），需要把train数据spilit为train_data,validation_data
@@ -81,42 +86,71 @@ def test(row):
             ans += row[column]
     return ans
 
-def main():
-    # 打开数据
-    train_df = pd.read_csv('../data/train.csv')
-    test_df = pd.read_csv('../data/test.csv')
-    # 合并重要信息，得到text的列
-    train_df['text'] = train_df.apply(lambda row:test(row),axis = 1)
-    test_df['text'] = test_df.apply(lambda row:test(row),axis = 1)
-    # 对text列进行清理处理
-    train_df['text'] = train_df['text'].apply(lambda x:clean_text(x))
-    test_df['text'] = test_df['text'].apply(lambda x:clean_text(x))
-    # 将train_df打乱，然后重置dateframe的index
-    train_df = train_df.sample(frac = 1).reset_index(drop= True)
-    # 得到x_train, x_test, y_train
-    x_train, x_test, y_train = TfIdf(train_df, test_df)
+def first_stage(x_train,y_train, x_test):
+    # 初始化两个dataframe用于存放第一训练集的预测结果和测试集的预测结果
+    df_train = pd.DataFrame([],columns=['RF','ExtraTrees','GB','LR'])
+    df_test = pd.DataFrame([], columns=['RF', 'ExtraTrees', 'GB', 'LR'])
 
+    print('start stage 1 ……\n')
+    # 1,随机森林
+    PARAMS_V1 = {
+        'n_estimators': 500, 'criterion': 'gini', 'n_jobs': 8, 'verbose': 0,
+        'random_state': 407, 'oob_score': True,
+    }
+    model = RandomForestClassifier(**PARAMS_V1)
+    print('开始训练模型,RF……\n')
+    model.fit(x_train, y_train)
+    # 做预测
+    df_train['RF'] =  model.predict(x_train)
+    df_test['RF'] =  model.predict(x_test)
+    print('训练结束')
+
+    # 2,ExtraTree
+    PARAMS_V2 = {
+        'n_estimators': 550, 'criterion': 'gini', 'n_jobs': 8, 'verbose': 0,
+        'random_state': 407,
+    }
+    model = ExtraTreesClassifier(**PARAMS_V2)
+    print('开始训练模型,ExtraTrees……\n')
+    model.fit(x_train, y_train)
+    # 做预测
+    df_train['ExtraTree'] =  model.predict(x_train)
+    df_test['ExtraTree'] =  model.predict(x_test)
+    print('训练结束')
+
+    # 3,GradientBoosting
+    PARAMS_V3 = {
+        'n_estimators': 300, 'learning_rate': 0.05, 'subsample': 0.8,
+        'max_depth': 5, 'verbose': 1, 'max_features': 0.9,
+        'random_state': 407,
+    }
+    model = GradientBoostingClassifier(**PARAMS_V3)
+    print('开始训练模型,GB……\n')
+    model.fit(x_train, y_train)
+    # 做预测
+    df_train['GB'] =  model.predict(x_train)
+    df_test['GB'] =  model.predict(x_test)
+    print('训练结束')
+
+    # 4,LR
     # 采用LR回归，先进行构建模型
     print('开始训练模型,LR……\n')
-    model_lr = LR(solver = 'liblinear')
-    model_lr.fit(x_train,y_train)
-    # 用10折交叉验证，验证准确率
-    print('10折交叉验证：Accuracy: ',end ='')
-    print(np.mean(cross_val_score(model_lr, x_train, y_train, cv = 10, scoring= 'accuracy')))
-    # 做预测
-    preds = model_lr.predict(x_test)
-    submission = pd.DataFrame({'id':range(len(preds)),'pred':preds}) # 将预测值转化为DataFrame
-    submission.to_csv("./lr_submission.csv",index = False, header= False)
-    print('\n预测完成，保存在./lr_submission.csv文件中。')
+    model = LR(solver='liblinear')
+    model.fit(x_train, y_train)
 
-    # sklearn 用到了label encoder
-    # 线性模型处理完之后，stark，然后在输入到lgb中
-    # LGBM
-    #https://blog.csdn.net/qq_34782535/article/details/89714372
+    # 做预测
+    df_train['LR'] =  model.predict(x_train)
+    df_test['LR'] =  model.predict(x_test)
+    print('训练结束')
+
+    print('stage 1 done\n')
+
+    return df_train,df_test
+
+def second_stage(train_x, train_y, x_test):
+    print('start stage 2 ……')
+    # 采用LGBM
     print('开始训练模型,LGBM……\n')
-    train_x, valid_x, train_y, valid_y = train_test_split(x_train, y_train, test_size=0.333, random_state=0)  # 分训练集和验证集
-    train = lgb.Dataset(train_x, train_y)
-    valid = lgb.Dataset(valid_x, valid_y, reference=train)
     parameters = {
         'max_depth': [15, 20, 25, 30, 35],
         'learning_rate': [0.01, 0.02, 0.05, 0.1, 0.15],
@@ -141,6 +175,7 @@ def main():
     # 有了gridsearch我们便不需要fit函数
     gsearch = GridSearchCV(gbm, param_grid=parameters, scoring='accuracy', cv=3)
     gsearch.fit(train_x, train_y)
+    print('stage 2 done\n')
 
     print("Best score: %0.3f" % gsearch.best_score_)
     print("Best parameters set:")
@@ -151,9 +186,28 @@ def main():
     # 做预测
     preds = gsearch.predict(x_test)
     submission = pd.DataFrame({'id':range(len(preds)),'pred':preds}) # 将预测值转化为DataFrame
-    submission.to_csv("./lgb_submission.csv",index = False, header= False)
-    print('\n预测完成，保存在./lgb_submission.csv文件中。')
+    submission.to_csv("./stacking_submission.csv",index = False, header= False)
+    print('\n预测完成，保存在./stacking_submission.csv文件中。')
 
+def main():
+    # 打开数据
+    train_df = pd.read_csv('../data/train.csv')
+    test_df = pd.read_csv('../data/test.csv')
+    # 合并重要信息，得到text的列
+    train_df['text'] = train_df.apply(lambda row:test(row),axis = 1)
+    test_df['text'] = test_df.apply(lambda row:test(row),axis = 1)
+    # 对text列进行清理处理
+    train_df['text'] = train_df['text'].apply(lambda x:clean_text(x))
+    test_df['text'] = test_df['text'].apply(lambda x:clean_text(x))
+    # 将train_df打乱，然后重置dateframe的index
+    train_df = train_df.sample(frac = 1).reset_index(drop= True)
+    # 得到x_train, x_test, y_train
+    x_train, x_test, y_train = TfIdf(train_df, test_df)
+
+    # stacking: stage_1
+    x_train,x_test = first_stage(x_train,y_train,x_test)
+    # stacking: stage_2
+    second_stage(x_train, y_train, x_test)
 
 if __name__ == '__main__':
     main()
